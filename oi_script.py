@@ -2,17 +2,22 @@ import os, time, requests
 from datetime import datetime, date, timedelta
 import calendar
 
-# ONLY TELEGRAM KEYS ARE NEEDED NOW
 TG_TOKEN   = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
+# Stronger headers to act like a real browser
 NSE_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/122.0 Safari/537.36"),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.nseindia.com/option-chain",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0"
 }
 MON, TUE, WED, THU, FRI = 0, 1, 2, 3, 4
 
@@ -53,8 +58,11 @@ def pick_expiry(available, target_date):
 def nse_session():
     s = requests.Session()
     s.headers.update(NSE_HEADERS)
-    s.get("https://www.nseindia.com", timeout=10)
-    time.sleep(1)
+    try:
+        s.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1)
+    except:
+        pass
     return s
 
 def nse_oi(session, symbol, expiry_rule):
@@ -87,8 +95,8 @@ def nse_oi(session, symbol, expiry_rule):
 def sensex_oi():
     try:
         s = requests.Session()
-        s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/"})
-        s.get("https://www.bseindia.com", timeout=10)
+        s.headers.update(NSE_HEADERS)
+        s.get("https://www.bseindia.com", timeout=15)
         exp_url = "https://api.bseindia.com/BseIndiaAPI/api/DerivExpiry/w?Scrip_cd=1&Type=IO"
         er = s.get(exp_url, timeout=15)
         expiries_raw = []
@@ -111,11 +119,13 @@ def sensex_oi():
             if po: puts[k] = po
         if not calls or not puts: return None
         return (max(calls, key=calls.get), max(puts, key=puts.get), chosen_exp or "NA")
-    except Exception: return None
+    except Exception as e: 
+        print(f"BSE error: {e}")
+        return None
 
 def mcx_oi(commodity):
     try:
-        r = requests.get("https://priceapi.moneycontrol.com/pricefeed/commodity/option/chain", params={"symbol": commodity, "expiry": "near"}, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get("https://priceapi.moneycontrol.com/pricefeed/commodity/option/chain", params={"symbol": commodity, "expiry": "near"}, timeout=15, headers={"User-Agent": NSE_HEADERS["User-Agent"]})
         if r.status_code != 200: return None
         calls, puts = {}, {}
         for row in r.json().get("data", {}).get("optionChain", []):
@@ -126,25 +136,36 @@ def mcx_oi(commodity):
             if po: puts[k] = po
         if not calls or not puts: return None
         return (max(calls, key=calls.get), max(puts, key=puts.get), "near-month")
-    except Exception: return None
+    except Exception as e: 
+        print(f"MCX {commodity} error: {e}")
+        return None
 
 def pair(p): return f"{p[0]},{p[1]}" if p else "NA,NA"
 
 def build_line():
     sess = nse_session()
     res, exps = {}, {}
+    
+    # Try NSE up to 3 times if it fails
     for sym, rule in [("NIFTY", ("weekly", TUE)), ("BANKNIFTY", ("monthly", TUE)), ("FINNIFTY", ("monthly", TUE)), ("MIDCPNIFTY", ("monthly", TUE))]:
-        out = nse_oi(sess, sym, rule)
+        out = None
+        for attempt in range(3):
+            out = nse_oi(sess, sym, rule)
+            if out: break
+            time.sleep(2) # wait and try again
         res[sym], exps[sym] = pair(out), out[2] if out else "NA"
-        time.sleep(0.5)
+        time.sleep(1)
+
     out = sensex_oi()
     res["SENSEX"], exps["SENSEX"] = pair(out), out[2] if out else "NA"
+    
     for sym in ["CRUDEOIL", "NATURALGAS", "GOLD"]:
         out = mcx_oi(sym)
         res[sym], exps[sym] = pair(out), out[2] if out else "NA"
-        time.sleep(0.5)
+        time.sleep(1)
+        
     line = f"{datetime.now().strftime('%d-%m-%Y')}|NIFTY:{res['NIFTY']}|BANKNIFTY:{res['BANKNIFTY']}|SENSEX:{res['SENSEX']}|FINNIFTY:{res['FINNIFTY']}|MIDCPNIFTY:{res['MIDCPNIFTY']}|CRUDEOIL:{res['CRUDEOIL']}|NATURALGAS:{res['NATURALGAS']}|GOLD:{res['GOLD']}|"
-    exp_line = "Expiries used → " + " | ".join(f"{k}:{v}" for k, v in exps.items())
+    exp_line = "Expiries used -> " + " | ".join(f"{k}:{v}" for k, v in exps.items())
     return line, exp_line
 
 def send_telegram(msg):
