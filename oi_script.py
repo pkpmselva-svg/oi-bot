@@ -5,21 +5,18 @@ import calendar
 TG_TOKEN   = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
-# Stronger headers to act like a real browser
-NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0"
-}
 MON, TUE, WED, THU, FRI = 0, 1, 2, 3, 4
+
+def fetch_via_proxy(url):
+    # This is a free proxy tunnel that NSE/BSE do not block
+    proxy_url = "https://api.allorigins.win/raw?url=" + requests.utils.quote(url, safe='')
+    try:
+        r = requests.get(proxy_url, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"Proxy error: {e}")
+    return None
 
 def last_weekday_of_month(year, month, weekday):
     last_day = calendar.monthrange(year, month)[1]
@@ -55,21 +52,12 @@ def pick_expiry(available, target_date):
         if dt >= target_date: return raw
     return parsed[0][1]
 
-def nse_session():
-    s = requests.Session()
-    s.headers.update(NSE_HEADERS)
+def nse_oi(symbol, expiry_rule):
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    j = fetch_via_proxy(url)
+    if not j or "records" not in j: return None
+    
     try:
-        s.get("https://www.nseindia.com", timeout=15)
-        time.sleep(1)
-    except:
-        pass
-    return s
-
-def nse_oi(session, symbol, expiry_rule):
-    try:
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        r = session.get(url, timeout=15)
-        j = r.json()
         expiries = j["records"].get("expiryDates", [])
         if not expiries: return None
         today = date.today()
@@ -89,29 +77,27 @@ def nse_oi(session, symbol, expiry_rule):
         if not calls or not puts: return None
         return (max(calls, key=calls.get), max(puts, key=puts.get), chosen)
     except Exception as e:
-        print(f"NSE {symbol} error: {e}")
+        print(f"NSE {symbol} parse error: {e}")
         return None
 
 def sensex_oi():
+    # Get expiry list
+    exp_url = "https://api.bseindia.com/BseIndiaAPI/api/DerivExpiry/w?Scrip_cd=1&Type=IO"
+    exp_json = fetch_via_proxy(exp_url)
+    expiries_raw = []
+    if exp_json:
+        expiries_raw = [x.get("Expiry_Date") if isinstance(x, dict) else x for x in (exp_json if isinstance(exp_json, list) else exp_json.get("Table", []))]
+    
+    today = date.today()
+    chosen_exp = pick_expiry(expiries_raw, nearest_monthly_expiry(today, THU)) or ""
+    
+    url = f"https://api.bseindia.com/BseIndiaAPI/api/DerivOptionChain/w?Scrip_cd=1&Expiry={chosen_exp}"
+    j = fetch_via_proxy(url)
+    if not j or "Table" not in j: return None
+    
     try:
-        s = requests.Session()
-        s.headers.update(NSE_HEADERS)
-        s.get("https://www.bseindia.com", timeout=15)
-        exp_url = "https://api.bseindia.com/BseIndiaAPI/api/DerivExpiry/w?Scrip_cd=1&Type=IO"
-        er = s.get(exp_url, timeout=15)
-        expiries_raw = []
-        if er.status_code == 200:
-            try:
-                js = er.json()
-                expiries_raw = [x.get("Expiry_Date") if isinstance(x, dict) else x for x in (js if isinstance(js, list) else js.get("Table", []))]
-            except Exception: pass
-        today = date.today()
-        chosen_exp = pick_expiry(expiries_raw, nearest_monthly_expiry(today, THU)) or ""
-        url = "https://api.bseindia.com/BseIndiaAPI/api/DerivOptionChain/w"
-        r = s.get(url, params={"Scrip_cd": "1", "Expiry": chosen_exp}, timeout=15)
-        rows = r.json().get("Table", [])
         calls, puts = {}, {}
-        for row in rows:
+        for row in j["Table"]:
             k = row.get("Strike_Price")
             co, po = row.get("C_Open_Int", 0) or 0, row.get("P_Open_Int", 0) or 0
             if k is None: continue
@@ -120,15 +106,17 @@ def sensex_oi():
         if not calls or not puts: return None
         return (max(calls, key=calls.get), max(puts, key=puts.get), chosen_exp or "NA")
     except Exception as e: 
-        print(f"BSE error: {e}")
+        print(f"BSE parse error: {e}")
         return None
 
 def mcx_oi(commodity):
+    url = f"https://priceapi.moneycontrol.com/pricefeed/commodity/option/chain?symbol={commodity}&expiry=near"
+    j = fetch_via_proxy(url)
+    if not j or "data" not in j: return None
+    
     try:
-        r = requests.get("https://priceapi.moneycontrol.com/pricefeed/commodity/option/chain", params={"symbol": commodity, "expiry": "near"}, timeout=15, headers={"User-Agent": NSE_HEADERS["User-Agent"]})
-        if r.status_code != 200: return None
         calls, puts = {}, {}
-        for row in r.json().get("data", {}).get("optionChain", []):
+        for row in j.get("data", {}).get("optionChain", []):
             k = row.get("strikePrice")
             co, po = row.get("callOi", 0) or 0, row.get("putOi", 0) or 0
             if k is None: continue
@@ -137,22 +125,16 @@ def mcx_oi(commodity):
         if not calls or not puts: return None
         return (max(calls, key=calls.get), max(puts, key=puts.get), "near-month")
     except Exception as e: 
-        print(f"MCX {commodity} error: {e}")
+        print(f"MCX {commodity} parse error: {e}")
         return None
 
 def pair(p): return f"{p[0]},{p[1]}" if p else "NA,NA"
 
 def build_line():
-    sess = nse_session()
     res, exps = {}, {}
     
-    # Try NSE up to 3 times if it fails
     for sym, rule in [("NIFTY", ("weekly", TUE)), ("BANKNIFTY", ("monthly", TUE)), ("FINNIFTY", ("monthly", TUE)), ("MIDCPNIFTY", ("monthly", TUE))]:
-        out = None
-        for attempt in range(3):
-            out = nse_oi(sess, sym, rule)
-            if out: break
-            time.sleep(2) # wait and try again
+        out = nse_oi(sym, rule)
         res[sym], exps[sym] = pair(out), out[2] if out else "NA"
         time.sleep(1)
 
